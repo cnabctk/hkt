@@ -3,4 +3,8 @@
 公网内网端口选择： 
       
       bash <(curl -fsSL https://raw.githubusercontent.com/cnabctk/hkt/refs/heads/main/port.sh)
-      bash <(curl -fsSL https://raw.githubusercontent.com/cnabctk/hkt/refs/heads/main/autoport.sh)
+     
+      
+      
+
+     bash <(curl -fsSL https://raw.githubusercontent.com/cnabctk/hkt/refs/heads/main/autoport.sh)
