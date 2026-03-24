@@ -239,10 +239,19 @@ select_port() {
             ;;
         3)
             read -p "请输入端口范围（格式：起始端口-结束端口，如：10000-20000）: " port_range
+            # 验证端口范围格式
             if [[ "$port_range" =~ ^[0-9]+-[0-9]+$ ]]; then
-                TARGET_PORTS="$port_range"
-                PORT_TYPE="range"
-                echo -e "${GREEN}✓ 已选择端口范围: $port_range${NC}"
+                # 提取起始和结束端口
+                START_PORT=$(echo $port_range | cut -d'-' -f1)
+                END_PORT=$(echo $port_range | cut -d'-' -f2)
+                if [ $START_PORT -le $END_PORT ] && [ $START_PORT -ge 1 ] && [ $END_PORT -le 65535 ]; then
+                    TARGET_PORTS="$port_range"
+                    PORT_TYPE="range"
+                    echo -e "${GREEN}✓ 已选择端口范围: $port_range${NC}"
+                else
+                    echo -e "${RED}错误：端口范围无效（必须在1-65535之间且起始端口≤结束端口）${NC}"
+                    exit 1
+                fi
             else
                 echo -e "${RED}错误：无效的端口范围格式${NC}"
                 exit 1
@@ -284,35 +293,15 @@ select_port() {
 cleanup_existing_config() {
     echo -e "${YELLOW}>>> 清理现有配置...${NC}"
     
-    # 清理 iptables 规则
-    if [ -n "$TARGET_PORTS" ]; then
-        # 清理 TCP 规则
-        if [ "$PORT_TYPE" = "single" ]; then
-            iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-            iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-            if [ "$SUPPORT_UDP" = "y" ]; then
-                iptables -t mangle -D OUTPUT -p udp --dport $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-                iptables -t mangle -D OUTPUT -p udp --dport $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-            fi
-        elif [ "$PORT_TYPE" = "multi" ]; then
-            IFS=',' read -ra PORT_ARRAY <<< "$TARGET_PORTS"
-            for port in "${PORT_ARRAY[@]}"; do
-                iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-                iptables -t mangle -D OUTPUT -p tcp --dport $port -j CONNMARK --save-mark 2>/dev/null || true
-                if [ "$SUPPORT_UDP" = "y" ]; then
-                    iptables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-                    iptables -t mangle -D OUTPUT -p udp --dport $port -j CONNMARK --save-mark 2>/dev/null || true
-                fi
-            done
-        elif [ "$PORT_TYPE" = "range" ]; then
-            iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-            iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-            if [ "$SUPPORT_UDP" = "y" ]; then
-                iptables -t mangle -D OUTPUT -p udp -m multiport --dports $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-                iptables -t mangle -D OUTPUT -p udp -m multiport --dports $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-            fi
-        fi
-    fi
+    # 清理 iptables 规则 - 使用更通用的清理方式
+    # 获取所有带标记的 OUTPUT 规则并删除
+    iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "MARK set 0x1" | awk '{print $1}' | sort -r | while read line; do
+        iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+    done
+    
+    iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "CONNMARK save" | awk '{print $1}' | sort -r | while read line; do
+        iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+    done
     
     # 清理连接标记恢复规则
     iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
@@ -326,7 +315,7 @@ cleanup_existing_config() {
     echo -e "${GREEN}✓ 清理完成${NC}"
 }
 
-# 生成 iptables 规则函数
+# 生成 iptables 规则函数（修正版）
 generate_iptables_rules() {
     local port_config="$1"
     local port_type="$2"
@@ -346,27 +335,27 @@ iptables -t mangle -A OUTPUT -p udp --dport $port_config -j CONNMARK --save-mark
             fi
             ;;
         multi)
-            IFS=',' read -ra PORT_ARRAY <<< "$port_config"
-            for port in "${PORT_ARRAY[@]}"; do
-                rules="$rules
-iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $mark_value
-iptables -t mangle -A OUTPUT -p tcp --dport $port -j CONNMARK --save-mark"
-            done
-            if [ "$support_udp" = "y" ]; then
-                for port in "${PORT_ARRAY[@]}"; do
-                    rules="$rules
-iptables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $mark_value
-iptables -t mangle -A OUTPUT -p udp --dport $port -j CONNMARK --save-mark"
-                done
-            fi
-            ;;
-        range)
+            # 对于多个端口，使用 multiport 模块更高效
+            # 将逗号分隔的端口转换为逗号分隔的列表（去掉空格）
+            PORT_LIST=$(echo $port_config | tr ',' ' ')
             rules="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j CONNMARK --save-mark"
             if [ "$support_udp" = "y" ]; then
                 rules="$rules
 iptables -t mangle -A OUTPUT -p udp -m multiport --dports $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p udp -m multiport --dports $port_config -j CONNMARK --save-mark"
+            fi
+            ;;
+        range)
+            # 对于端口范围，使用 multiport 模块，格式为 port:port
+            # 将 10000-20000 转换为 10000:20000
+            PORT_RANGE=$(echo $port_config | sed 's/-/:/')
+            rules="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $PORT_RANGE -j MARK --set-mark $mark_value
+iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $PORT_RANGE -j CONNMARK --save-mark"
+            if [ "$support_udp" = "y" ]; then
+                rules="$rules
+iptables -t mangle -A OUTPUT -p udp -m multiport --dports $PORT_RANGE -j MARK --set-mark $mark_value
+iptables -t mangle -A OUTPUT -p udp -m multiport --dports $PORT_RANGE -j CONNMARK --save-mark"
             fi
             ;;
     esac
@@ -476,81 +465,79 @@ SERVICE_FILE="/etc/systemd/system/route-port-${PORT_FILENAME}.service"
 SCRIPT_FILE="/usr/local/bin/route-port-${PORT_FILENAME}.sh"
 
 # 生成应用规则的脚本
-cat > $SCRIPT_FILE <<EOF
+cat > $SCRIPT_FILE <<'EOF'
 #!/bin/bash
 # 自动应用端口分流规则（由一键脚本生成）
-# 生成时间: $(date)
 
-INTERFACE="$INTERFACE"
-PUBLIC_GW="$PUBLIC_GW"
-PUBLIC_IP="$PUBLIC_IP"
-PRIVATE_GW="$PRIVATE_GW"
-PRIVATE_IP="$PRIVATE_IP"
-TARGET_PORTS="$TARGET_PORTS"
-PORT_TYPE="$PORT_TYPE"
-MARK_VALUE="$MARK_VALUE"
-TABLE_ID="$TABLE_ID"
-TABLE_NAME="$TABLE_NAME"
-SUPPORT_UDP="$SUPPORT_UDP"
+INTERFACE="__INTERFACE__"
+PUBLIC_GW="__PUBLIC_GW__"
+PUBLIC_IP="__PUBLIC_IP__"
+PRIVATE_GW="__PRIVATE_GW__"
+PRIVATE_IP="__PRIVATE_IP__"
+TARGET_PORTS="__TARGET_PORTS__"
+PORT_TYPE="__PORT_TYPE__"
+MARK_VALUE="__MARK_VALUE__"
+TABLE_ID="__TABLE_ID__"
+TABLE_NAME="__TABLE_NAME__"
+SUPPORT_UDP="__SUPPORT_UDP__"
 
 # 等待网络就绪
 sleep 2
 
 # 设置 sysctl
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
 
 # 设置主路由表
 ip route del default 2>/dev/null || true
-ip route del default dev \$INTERFACE 2>/dev/null || true
-ip route add default via \$PUBLIC_GW dev \$INTERFACE src \$PUBLIC_IP
+ip route del default dev $INTERFACE 2>/dev/null || true
+ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
 
 # 设置内网路由表
-ip route del default via \$PRIVATE_GW dev \$INTERFACE table \$TABLE_NAME 2>/dev/null || true
-ip route add default via \$PRIVATE_GW dev \$INTERFACE src \$PRIVATE_IP table \$TABLE_NAME
+ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
+ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
 
-# 清除旧规则
-iptables -t mangle -D PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+# 清理旧规则
+# 获取所有带标记的 OUTPUT 规则并删除
+iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "MARK set 0x1" | awk '{print $1}' | sort -r | while read line; do
+    iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+done
 
-# 根据端口类型清理规则
-if [ "$PORT_TYPE" = "single" ]; then
-    iptables -t mangle -D OUTPUT -p tcp --dport \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp --dport \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-    if [ "\$SUPPORT_UDP" = "y" ]; then
-        iptables -t mangle -D OUTPUT -p udp --dport \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p udp --dport \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-    fi
-elif [ "$PORT_TYPE" = "multi" ]; then
-    IFS=',' read -ra PORTS <<< "\$TARGET_PORTS"
-    for port in "\${PORTS[@]}"; do
-        iptables -t mangle -D OUTPUT -p tcp --dport \$port -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p tcp --dport \$port -j CONNMARK --save-mark 2>/dev/null || true
-        if [ "\$SUPPORT_UDP" = "y" ]; then
-            iptables -t mangle -D OUTPUT -p udp --dport \$port -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-            iptables -t mangle -D OUTPUT -p udp --dport \$port -j CONNMARK --save-mark 2>/dev/null || true
-        fi
-    done
-elif [ "$PORT_TYPE" = "range" ]; then
-    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-    if [ "\$SUPPORT_UDP" = "y" ]; then
-        iptables -t mangle -D OUTPUT -p udp -m multiport --dports \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p udp -m multiport --dports \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
-    fi
-fi
+iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "CONNMARK save" | awk '{print $1}' | sort -r | while read line; do
+    iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+done
+
+iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
 
 # 添加新规则
-$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
+__IPTABLES_RULES__
 
 # 添加连接标记恢复规则
-iptables -t mangle -A PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark
+iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark
 
 # 添加策略路由规则
-ip rule del fwmark \$MARK_VALUE table \$TABLE_NAME 2>/dev/null || true
-ip rule add fwmark \$MARK_VALUE table \$TABLE_NAME
+ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
+ip rule add fwmark $MARK_VALUE table $TABLE_NAME
 
 exit 0
 EOF
+
+# 替换脚本中的变量
+sed -i "s/__INTERFACE__/$INTERFACE/g" $SCRIPT_FILE
+sed -i "s/__PUBLIC_GW__/$PUBLIC_GW/g" $SCRIPT_FILE
+sed -i "s/__PUBLIC_IP__/$PUBLIC_IP/g" $SCRIPT_FILE
+sed -i "s/__PRIVATE_GW__/$PRIVATE_GW/g" $SCRIPT_FILE
+sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" $SCRIPT_FILE
+sed -i "s/__TARGET_PORTS__/$TARGET_PORTS/g" $SCRIPT_FILE
+sed -i "s/__PORT_TYPE__/$PORT_TYPE/g" $SCRIPT_FILE
+sed -i "s/__MARK_VALUE__/$MARK_VALUE/g" $SCRIPT_FILE
+sed -i "s/__TABLE_ID__/$TABLE_ID/g" $SCRIPT_FILE
+sed -i "s/__TABLE_NAME__/$TABLE_NAME/g" $SCRIPT_FILE
+sed -i "s/__SUPPORT_UDP__/$SUPPORT_UDP/g" $SCRIPT_FILE
+
+# 生成 iptables 规则并替换（需要转义特殊字符）
+IPTABLES_RULES_ESC=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP" | sed 's/[&/\]/\\&/g')
+sed -i "s/__IPTABLES_RULES__/$IPTABLES_RULES_ESC/g" $SCRIPT_FILE
 
 chmod +x $SCRIPT_FILE
 
@@ -600,7 +587,12 @@ echo "--- 策略路由规则 ---"
 ip rule show
 echo ""
 echo "--- iptables mangle 规则 ---"
-iptables -t mangle -L -n -v | grep -E "($(echo $TARGET_PORTS | tr ',' '|' | tr '-' '|'))|CONNMARK" | head -10
+echo "TCP 规则："
+iptables -t mangle -L OUTPUT -n -v | grep -E "tcp.*dpt:$TARGET_PORTS" || echo "未找到 TCP 规则"
+if [ "$SUPPORT_UDP" = "y" ]; then
+    echo "UDP 规则："
+    iptables -t mangle -L OUTPUT -n -v | grep -E "udp.*dpt:$TARGET_PORTS" || echo "未找到 UDP 规则"
+fi
 echo ""
 echo -e "${YELLOW}验证命令：${NC}"
 echo "1. 测试内网端口分流："
@@ -618,5 +610,3 @@ echo "   systemctl disable route-port-${PORT_FILENAME}.service"
 echo "   systemctl stop route-port-${PORT_FILENAME}.service"
 echo "   rm $SERVICE_FILE $SCRIPT_FILE"
 echo "   systemctl daemon-reload"
-echo "   iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark"
-echo "   ip rule del fwmark $MARK_VALUE table $TABLE_NAME"
