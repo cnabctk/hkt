@@ -21,6 +21,9 @@ PRIVATE_IP=""
 MARK_VALUE="1"
 TABLE_ID="100"
 TABLE_NAME="inner"
+TARGET_PORTS=""
+PORT_TYPE=""
+SUPPORT_UDP="n"
 
 # 自动检测网络配置函数
 detect_network_config() {
@@ -31,7 +34,7 @@ detect_network_config() {
     
     # 1. 检测网卡（排除虚拟网卡和回环接口）
     echo -e "${YELLOW}>>> 检测可用网卡...${NC}"
-    INTERFACES=$(ip -o link show | grep -v lo | grep -v docker | grep -v veth | grep -v br- | awk -F': ' '{print $2}' | grep -v '@')
+    INTERFACES=$(ip -o link show | grep -v lo | grep -v docker | grep -v veth | grep -v br- | awk -F': ' '{print $2}' | grep -v '@' | sed 's/@.*//')
     
     if [ -z "$INTERFACES" ]; then
         echo -e "${RED}错误：未检测到有效的网卡${NC}"
@@ -163,7 +166,6 @@ detect_network_config() {
             read -p "是否将 $DEFAULT_GW 作为内网网关？[y/N]: " use_as_private
             if [[ "$use_as_private" =~ ^[Yy]$ ]]; then
                 PRIVATE_GW="$DEFAULT_GW"
-                # 需要手动输入公网网关
                 read -p "请输入公网网关地址: " PUBLIC_GW
             else
                 read -p "请输入内网网关地址: " PRIVATE_GW
@@ -194,32 +196,6 @@ detect_network_config() {
     echo -e "${GREEN}✓ 公网网关: $PUBLIC_GW${NC}"
     echo -e "${GREEN}✓ 内网网关: $PRIVATE_GW${NC}"
     
-    # 验证IP和网关是否在同一网段
-    echo -e "${YELLOW}>>> 验证网络配置...${NC}"
-    
-    # 简单的网段验证
-    PUBLIC_NETWORK=$(echo $PUBLIC_IP | cut -d. -f1-3)
-    PUBLIC_GW_NETWORK=$(echo $PUBLIC_GW | cut -d. -f1-3)
-    PRIVATE_NETWORK=$(echo $PRIVATE_IP | cut -d. -f1-3)
-    PRIVATE_GW_NETWORK=$(echo $PRIVATE_GW | cut -d. -f1-3)
-    
-    if [ "$PUBLIC_NETWORK" != "$PUBLIC_GW_NETWORK" ]; then
-        echo -e "${YELLOW}警告：公网IP ($PUBLIC_IP) 和公网网关 ($PUBLIC_GW) 可能不在同一网段${NC}"
-        read -p "是否继续？[y/N]: " continue
-        if [[ ! "$continue" =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-    
-    if [ "$PRIVATE_NETWORK" != "$PRIVATE_GW_NETWORK" ]; then
-        echo -e "${YELLOW}警告：内网IP ($PRIVATE_IP) 和内网网关 ($PRIVATE_GW) 可能不在同一网段${NC}"
-        read -p "是否继续？[y/N]: " continue
-        if [[ ! "$continue" =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-    
-    echo -e "${GREEN}✓ 网络配置验证通过${NC}"
     echo ""
 }
 
@@ -282,9 +258,18 @@ select_port() {
             ;;
     esac
     
+    # 询问是否需要UDP支持
+    read -p "是否需要同时支持UDP协议？[y/N]: " SUPPORT_UDP
+    if [[ "$SUPPORT_UDP" =~ ^[Yy]$ ]]; then
+        SUPPORT_UDP="y"
+    else
+        SUPPORT_UDP="n"
+    fi
+    
     echo ""
     echo -e "${YELLOW}确认配置：${NC}"
     echo -e "  端口: ${GREEN}$TARGET_PORTS${NC}"
+    echo -e "  协议: ${GREEN}TCP${SUPPORT_UDP:+, UDP}${NC}"
     echo -e "  将走内网网关: ${GREEN}$PRIVATE_GW${NC} (源IP: $PRIVATE_IP)"
     echo -e "  其他端口走公网网关: ${GREEN}$PUBLIC_GW${NC} (源IP: $PUBLIC_IP)"
     echo ""
@@ -295,11 +280,58 @@ select_port() {
     fi
 }
 
+# 清理现有配置函数
+cleanup_existing_config() {
+    echo -e "${YELLOW}>>> 清理现有配置...${NC}"
+    
+    # 清理 iptables 规则
+    if [ -n "$TARGET_PORTS" ]; then
+        # 清理 TCP 规则
+        if [ "$PORT_TYPE" = "single" ]; then
+            iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+            iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+            if [ "$SUPPORT_UDP" = "y" ]; then
+                iptables -t mangle -D OUTPUT -p udp --dport $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+                iptables -t mangle -D OUTPUT -p udp --dport $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+            fi
+        elif [ "$PORT_TYPE" = "multi" ]; then
+            IFS=',' read -ra PORT_ARRAY <<< "$TARGET_PORTS"
+            for port in "${PORT_ARRAY[@]}"; do
+                iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+                iptables -t mangle -D OUTPUT -p tcp --dport $port -j CONNMARK --save-mark 2>/dev/null || true
+                if [ "$SUPPORT_UDP" = "y" ]; then
+                    iptables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p udp --dport $port -j CONNMARK --save-mark 2>/dev/null || true
+                fi
+            done
+        elif [ "$PORT_TYPE" = "range" ]; then
+            iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+            iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+            if [ "$SUPPORT_UDP" = "y" ]; then
+                iptables -t mangle -D OUTPUT -p udp -m multiport --dports $TARGET_PORTS -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+                iptables -t mangle -D OUTPUT -p udp -m multiport --dports $TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+            fi
+        fi
+    fi
+    
+    # 清理连接标记恢复规则
+    iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+    
+    # 清理策略路由规则
+    ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
+    
+    # 清理自定义路由表中的路由
+    ip route flush table $TABLE_NAME 2>/dev/null || true
+    
+    echo -e "${GREEN}✓ 清理完成${NC}"
+}
+
 # 生成 iptables 规则函数
 generate_iptables_rules() {
     local port_config="$1"
     local port_type="$2"
     local mark_value="$3"
+    local support_udp="$4"
     
     local rules=""
     
@@ -307,9 +339,7 @@ generate_iptables_rules() {
         single)
             rules="iptables -t mangle -A OUTPUT -p tcp --dport $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp --dport $port_config -j CONNMARK --save-mark"
-            # 可选：添加UDP支持
-            read -p "是否需要同时支持UDP协议？[y/N]: " support_udp
-            if [[ "$support_udp" =~ ^[Yy]$ ]]; then
+            if [ "$support_udp" = "y" ]; then
                 rules="$rules
 iptables -t mangle -A OUTPUT -p udp --dport $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p udp --dport $port_config -j CONNMARK --save-mark"
@@ -322,8 +352,7 @@ iptables -t mangle -A OUTPUT -p udp --dport $port_config -j CONNMARK --save-mark
 iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp --dport $port -j CONNMARK --save-mark"
             done
-            read -p "是否需要同时支持UDP协议？[y/N]: " support_udp
-            if [[ "$support_udp" =~ ^[Yy]$ ]]; then
+            if [ "$support_udp" = "y" ]; then
                 for port in "${PORT_ARRAY[@]}"; do
                     rules="$rules
 iptables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $mark_value
@@ -334,8 +363,7 @@ iptables -t mangle -A OUTPUT -p udp --dport $port -j CONNMARK --save-mark"
         range)
             rules="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j CONNMARK --save-mark"
-            read -p "是否需要同时支持UDP协议？[y/N]: " support_udp
-            if [[ "$support_udp" =~ ^[Yy]$ ]]; then
+            if [ "$support_udp" = "y" ]; then
                 rules="$rules
 iptables -t mangle -A OUTPUT -p udp -m multiport --dports $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p udp -m multiport --dports $port_config -j CONNMARK --save-mark"
@@ -358,6 +386,9 @@ detect_network_config
 # 交互式端口选择
 select_port
 
+# 清理现有配置
+cleanup_existing_config
+
 # 开始配置
 echo ""
 echo -e "${GREEN}>>> 开始配置端口分流...${NC}"
@@ -365,8 +396,8 @@ echo ""
 
 # 1. 设置 sysctl：关闭反向路径过滤
 echo ">>> 配置 sysctl..."
-sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
-sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
 
 # 持久化 sysctl 配置
 if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf 2>/dev/null; then
@@ -406,27 +437,26 @@ if ! grep -q "^$TABLE_ID $TABLE_NAME" $RT_TABLES 2>/dev/null; then
     echo ">>> 已在 $RT_TABLES 中添加路由表定义"
 fi
 
-# 3. 设置主路由表
+# 3. 设置主路由表（先删除可能存在的默认路由）
 echo ">>> 设置主路由表公网默认路由..."
+# 删除所有默认路由
+ip route del default 2>/dev/null || true
+# 删除指定接口的默认路由
 ip route del default dev $INTERFACE 2>/dev/null || true
+# 添加新的默认路由
 ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
 
 # 4. 创建内网路由表
 echo ">>> 配置内网路由表..."
+# 先删除表100中的默认路由
 ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
+# 添加新的内网路由
 ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
 
 # 5. 配置 iptables 标记
 echo ">>> 配置 iptables 标记..."
-# 清除旧规则
-iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p udp --dport $TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p udp -m multiport --dports $TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
-
 # 生成并应用 iptables 规则
-IPTABLES_RULES=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE")
+IPTABLES_RULES=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
 eval "$IPTABLES_RULES"
 
 # 添加连接标记恢复规则
@@ -434,7 +464,9 @@ iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j
 
 # 6. 添加策略路由规则
 echo ">>> 添加策略路由规则..."
+# 删除可能已存在的相同规则
 ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
+# 添加新规则
 ip rule add fwmark $MARK_VALUE table $TABLE_NAME
 
 # 7. 持久化配置
@@ -457,16 +489,19 @@ PRIVATE_IP="$PRIVATE_IP"
 TARGET_PORTS="$TARGET_PORTS"
 PORT_TYPE="$PORT_TYPE"
 MARK_VALUE="$MARK_VALUE"
+TABLE_ID="$TABLE_ID"
 TABLE_NAME="$TABLE_NAME"
+SUPPORT_UDP="$SUPPORT_UDP"
 
 # 等待网络就绪
 sleep 2
 
 # 设置 sysctl
-sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
-sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
 
 # 设置主路由表
+ip route del default 2>/dev/null || true
 ip route del default dev \$INTERFACE 2>/dev/null || true
 ip route add default via \$PUBLIC_GW dev \$INTERFACE src \$PUBLIC_IP
 
@@ -475,14 +510,37 @@ ip route del default via \$PRIVATE_GW dev \$INTERFACE table \$TABLE_NAME 2>/dev/
 ip route add default via \$PRIVATE_GW dev \$INTERFACE src \$PRIVATE_IP table \$TABLE_NAME
 
 # 清除旧规则
-iptables -t mangle -D OUTPUT -p tcp --dport \$TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p tcp -m multiport --dports \$TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p udp --dport \$TARGET_PORTS 2>/dev/null || true
-iptables -t mangle -D OUTPUT -p udp -m multiport --dports \$TARGET_PORTS 2>/dev/null || true
 iptables -t mangle -D PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
 
+# 根据端口类型清理规则
+if [ "$PORT_TYPE" = "single" ]; then
+    iptables -t mangle -D OUTPUT -p tcp --dport \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --dport \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+    if [ "\$SUPPORT_UDP" = "y" ]; then
+        iptables -t mangle -D OUTPUT -p udp --dport \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p udp --dport \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+    fi
+elif [ "$PORT_TYPE" = "multi" ]; then
+    IFS=',' read -ra PORTS <<< "\$TARGET_PORTS"
+    for port in "\${PORTS[@]}"; do
+        iptables -t mangle -D OUTPUT -p tcp --dport \$port -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p tcp --dport \$port -j CONNMARK --save-mark 2>/dev/null || true
+        if [ "\$SUPPORT_UDP" = "y" ]; then
+            iptables -t mangle -D OUTPUT -p udp --dport \$port -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+            iptables -t mangle -D OUTPUT -p udp --dport \$port -j CONNMARK --save-mark 2>/dev/null || true
+        fi
+    done
+elif [ "$PORT_TYPE" = "range" ]; then
+    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+    if [ "\$SUPPORT_UDP" = "y" ]; then
+        iptables -t mangle -D OUTPUT -p udp -m multiport --dports \$TARGET_PORTS -j MARK --set-mark \$MARK_VALUE 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p udp -m multiport --dports \$TARGET_PORTS -j CONNMARK --save-mark 2>/dev/null || true
+    fi
+fi
+
 # 添加新规则
-$IPTABLES_RULES
+$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
 
 # 添加连接标记恢复规则
 iptables -t mangle -A PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark
@@ -529,14 +587,14 @@ echo -e "${CYAN}配置摘要：${NC}"
 echo -e "  网卡: ${GREEN}$INTERFACE${NC}"
 echo -e "  公网IP: ${GREEN}$PUBLIC_IP${NC} | 网关: ${GREEN}$PUBLIC_GW${NC}"
 echo -e "  内网IP: ${GREEN}$PRIVATE_IP${NC} | 网关: ${GREEN}$PRIVATE_GW${NC}"
-echo -e "  分流端口: ${GREEN}$TARGET_PORTS${NC} (协议: TCP${SUPPORT_UDP:+,UDP})"
+echo -e "  分流端口: ${GREEN}$TARGET_PORTS${NC} (协议: TCP${SUPPORT_UDP:+, UDP})"
 echo ""
 echo -e "${YELLOW}当前路由规则：${NC}"
 echo "--- 主路由表 ---"
 ip route show table main
 echo ""
 echo "--- 内网路由表 (table $TABLE_NAME) ---"
-ip route show table $TABLE_NAME
+ip route show table $TABLE_NAME 2>/dev/null || echo "路由表为空"
 echo ""
 echo "--- 策略路由规则 ---"
 ip rule show
@@ -556,5 +614,9 @@ echo ""
 echo -e "${GREEN}✓ 配置已持久化，重启后自动生效${NC}"
 echo ""
 echo -e "${YELLOW}回滚命令：${NC}"
-echo "   systemctl disable route-port-${PORT_FILENAME}.service && systemctl stop route-port-${PORT_FILENAME}.service"
-echo "   rm $SERVICE_FILE $SCRIPT_FILE && systemctl daemon-reload"
+echo "   systemctl disable route-port-${PORT_FILENAME}.service"
+echo "   systemctl stop route-port-${PORT_FILENAME}.service"
+echo "   rm $SERVICE_FILE $SCRIPT_FILE"
+echo "   systemctl daemon-reload"
+echo "   iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark"
+echo "   ip rule del fwmark $MARK_VALUE table $TABLE_NAME"
