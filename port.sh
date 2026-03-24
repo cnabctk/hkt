@@ -1,6 +1,6 @@
 #!/bin/bash
-# 一键脚本：使本机发出的指定端口流量走内网网关，其余流量走公网网关
-# 自动检测网络配置，支持交互式端口选择
+# 一键脚本：使本机发出的指定端口流量走指定网关（公网或内网），其余流量走另一个网关
+# 自动检测网络配置，支持交互式端口选择和方向选择
 
 set -e
 
@@ -24,6 +24,7 @@ TABLE_NAME="inner"
 TARGET_PORTS=""
 PORT_TYPE=""
 SUPPORT_UDP="n"
+ROUTE_DIRECTION=""  # 新增：路由方向（public 或 private）
 
 # 自动检测网络配置函数
 detect_network_config() {
@@ -199,10 +200,39 @@ detect_network_config() {
     echo ""
 }
 
+# 选择路由方向函数
+select_direction() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${GREEN}选择端口路由方向${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+    echo -e "${YELLOW}请选择端口流量的路由方向：${NC}"
+    echo "1) 走公网网关 (${GREEN}$PUBLIC_GW${NC}) - 源IP: $PUBLIC_IP"
+    echo "2) 走内网网关 (${GREEN}$PRIVATE_GW${NC}) - 源IP: $PRIVATE_IP"
+    echo ""
+    read -p "请选择 [1-2]: " dir_choice
+    
+    case $dir_choice in
+        1)
+            ROUTE_DIRECTION="public"
+            echo -e "${GREEN}✓ 已选择：指定端口走公网网关${NC}"
+            ;;
+        2)
+            ROUTE_DIRECTION="private"
+            echo -e "${GREEN}✓ 已选择：指定端口走内网网关${NC}"
+            ;;
+        *)
+            echo -e "${RED}错误：无效的选择${NC}"
+            exit 1
+            ;;
+    esac
+    echo ""
+}
+
 # 交互式端口选择函数
 select_port() {
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${GREEN}端口分流配置向导${NC}"
+    echo -e "${GREEN}端口配置向导${NC}"
     echo -e "${BLUE}========================================${NC}"
     echo ""
     echo -e "${YELLOW}请选择要配置的端口：${NC}"
@@ -276,11 +306,25 @@ select_port() {
     fi
     
     echo ""
+    
+    # 显示确认信息
+    if [ "$ROUTE_DIRECTION" = "public" ]; then
+        DIRECTION_TEXT="公网网关 ($PUBLIC_GW)"
+        SOURCE_IP="$PUBLIC_IP"
+        OTHER_GATEWAY="内网网关 ($PRIVATE_GW)"
+        OTHER_IP="$PRIVATE_IP"
+    else
+        DIRECTION_TEXT="内网网关 ($PRIVATE_GW)"
+        SOURCE_IP="$PRIVATE_IP"
+        OTHER_GATEWAY="公网网关 ($PUBLIC_GW)"
+        OTHER_IP="$PUBLIC_IP"
+    fi
+    
     echo -e "${YELLOW}确认配置：${NC}"
     echo -e "  端口: ${GREEN}$TARGET_PORTS${NC}"
     echo -e "  协议: ${GREEN}TCP${SUPPORT_UDP:+, UDP}${NC}"
-    echo -e "  将走内网网关: ${GREEN}$PRIVATE_GW${NC} (源IP: $PRIVATE_IP)"
-    echo -e "  其他端口走公网网关: ${GREEN}$PUBLIC_GW${NC} (源IP: $PUBLIC_IP)"
+    echo -e "  将走: ${GREEN}$DIRECTION_TEXT${NC} (源IP: $SOURCE_IP)"
+    echo -e "  其他端口走: ${GREEN}$OTHER_GATEWAY${NC} (源IP: $OTHER_IP)"
     echo ""
     read -p "是否继续配置？[y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -315,7 +359,7 @@ cleanup_existing_config() {
     echo -e "${GREEN}✓ 清理完成${NC}"
 }
 
-# 生成 iptables 规则函数（修正版）
+# 生成 iptables 规则函数
 generate_iptables_rules() {
     local port_config="$1"
     local port_type="$2"
@@ -368,6 +412,9 @@ fi
 
 # 自动检测网络配置
 detect_network_config
+
+# 选择路由方向
+select_direction
 
 # 交互式端口选择
 select_port
@@ -423,23 +470,36 @@ if ! grep -q "^$TABLE_ID $TABLE_NAME" $RT_TABLES 2>/dev/null; then
     echo ">>> 已在 $RT_TABLES 中添加路由表定义"
 fi
 
-# 3. 设置主路由表（先删除可能存在的默认路由）
-echo ">>> 设置主路由表公网默认路由..."
-# 删除所有默认路由
+# 3. 设置路由表
+echo ">>> 设置路由表..."
+
+# 根据选择的方向设置主路由表和标记路由表
+if [ "$ROUTE_DIRECTION" = "public" ]; then
+    # 主路由表走公网，标记路由表走内网
+    MAIN_GW="$PUBLIC_GW"
+    MAIN_SRC="$PUBLIC_IP"
+    MARKED_GW="$PRIVATE_GW"
+    MARKED_SRC="$PRIVATE_IP"
+    echo "配置：默认走公网，标记端口走内网"
+else
+    # 主路由表走内网，标记路由表走公网
+    MAIN_GW="$PRIVATE_GW"
+    MAIN_SRC="$PRIVATE_IP"
+    MARKED_GW="$PUBLIC_GW"
+    MARKED_SRC="$PUBLIC_IP"
+    echo "配置：默认走内网，标记端口走公网"
+fi
+
+# 设置主路由表
 ip route del default 2>/dev/null || true
-# 删除指定接口的默认路由
 ip route del default dev $INTERFACE 2>/dev/null || true
-# 添加新的默认路由
-ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
+ip route add default via $MAIN_GW dev $INTERFACE src $MAIN_SRC
 
-# 4. 创建内网路由表
-echo ">>> 配置内网路由表..."
-# 先删除表100中的默认路由
-ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
-# 添加新的内网路由
-ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
+# 设置标记路由表
+ip route del default via $MARKED_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
+ip route add default via $MARKED_GW dev $INTERFACE src $MARKED_SRC table $TABLE_NAME
 
-# 5. 配置 iptables 标记
+# 4. 配置 iptables 标记
 echo ">>> 配置 iptables 标记..."
 # 生成并应用 iptables 规则
 IPTABLES_RULES=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
@@ -448,14 +508,14 @@ eval "$IPTABLES_RULES"
 # 添加连接标记恢复规则
 iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark
 
-# 6. 添加策略路由规则
+# 5. 添加策略路由规则
 echo ">>> 添加策略路由规则..."
 # 删除可能已存在的相同规则
 ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
 # 添加新规则
 ip rule add fwmark $MARK_VALUE table $TABLE_NAME
 
-# 7. 持久化配置
+# 6. 持久化配置
 echo ">>> 创建 systemd 服务..."
 PORT_FILENAME=$(echo "$TARGET_PORTS" | tr ',' '_' | tr '-' '_')
 SERVICE_FILE="/etc/systemd/system/route-port-${PORT_FILENAME}.service"
@@ -464,13 +524,14 @@ SCRIPT_FILE="/usr/local/bin/route-port-${PORT_FILENAME}.sh"
 # 生成 iptables 规则用于持久化脚本
 IPTABLES_RULES_FOR_SCRIPT=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
 
-# 生成应用规则的脚本（使用 cat 和 EOF 直接嵌入，避免 sed 转义问题）
+# 生成应用规则的脚本
 cat > $SCRIPT_FILE <<EOF
 #!/bin/bash
 # 自动应用端口分流规则（由一键脚本生成）
 # 生成时间: $(date)
 
 INTERFACE="$INTERFACE"
+ROUTE_DIRECTION="$ROUTE_DIRECTION"
 PUBLIC_GW="$PUBLIC_GW"
 PUBLIC_IP="$PUBLIC_IP"
 PRIVATE_GW="$PRIVATE_GW"
@@ -482,6 +543,19 @@ TABLE_ID="$TABLE_ID"
 TABLE_NAME="$TABLE_NAME"
 SUPPORT_UDP="$SUPPORT_UDP"
 
+# 根据方向设置网关和源IP
+if [ "\$ROUTE_DIRECTION" = "public" ]; then
+    MAIN_GW="$PUBLIC_GW"
+    MAIN_SRC="$PUBLIC_IP"
+    MARKED_GW="$PRIVATE_GW"
+    MARKED_SRC="$PRIVATE_IP"
+else
+    MAIN_GW="$PRIVATE_GW"
+    MAIN_SRC="$PRIVATE_IP"
+    MARKED_GW="$PUBLIC_GW"
+    MARKED_SRC="$PUBLIC_IP"
+fi
+
 # 等待网络就绪
 sleep 2
 
@@ -492,11 +566,11 @@ sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
 # 设置主路由表
 ip route del default 2>/dev/null || true
 ip route del default dev \$INTERFACE 2>/dev/null || true
-ip route add default via \$PUBLIC_GW dev \$INTERFACE src \$PUBLIC_IP
+ip route add default via \$MAIN_GW dev \$INTERFACE src \$MAIN_SRC
 
-# 设置内网路由表
-ip route del default via \$PRIVATE_GW dev \$INTERFACE table \$TABLE_NAME 2>/dev/null || true
-ip route add default via \$PRIVATE_GW dev \$INTERFACE src \$PRIVATE_IP table \$TABLE_NAME
+# 设置标记路由表
+ip route del default via \$MARKED_GW dev \$INTERFACE table \$TABLE_NAME 2>/dev/null || true
+ip route add default via \$MARKED_GW dev \$INTERFACE src \$MARKED_SRC table \$TABLE_NAME
 
 # 清理旧规则
 # 获取所有带标记的 OUTPUT 规则并删除
@@ -528,7 +602,7 @@ chmod +x $SCRIPT_FILE
 # 创建 systemd 服务单元
 cat > $SERVICE_FILE <<EOF
 [Unit]
-Description=Route Port $TARGET_PORTS via Private Gateway
+Description=Route Port $TARGET_PORTS via $(if [ "$ROUTE_DIRECTION" = "public" ]; then echo "Public"; else echo "Private"; fi) Gateway
 After=network.target network-online.target
 Wants=network.target
 Before=multi-user.target
@@ -556,36 +630,47 @@ echo "=========================================="
 echo ""
 echo -e "${CYAN}配置摘要：${NC}"
 echo -e "  网卡: ${GREEN}$INTERFACE${NC}"
-echo -e "  公网IP: ${GREEN}$PUBLIC_IP${NC} | 网关: ${GREEN}$PUBLIC_GW${NC}"
-echo -e "  内网IP: ${GREEN}$PRIVATE_IP${NC} | 网关: ${GREEN}$PRIVATE_GW${NC}"
+echo -e "  公网: ${GREEN}$PUBLIC_IP${NC} | 网关: ${GREEN}$PUBLIC_GW${NC}"
+echo -e "  内网: ${GREEN}$PRIVATE_IP${NC} | 网关: ${GREEN}$PRIVATE_GW${NC}"
 echo -e "  分流端口: ${GREEN}$TARGET_PORTS${NC} (协议: TCP${SUPPORT_UDP:+, UDP})"
+if [ "$ROUTE_DIRECTION" = "public" ]; then
+    echo -e "  路由策略: 指定端口走 ${GREEN}公网网关${NC}，其他端口走 ${GREEN}内网网关${NC}"
+else
+    echo -e "  路由策略: 指定端口走 ${GREEN}内网网关${NC}，其他端口走 ${GREEN}公网网关${NC}"
+fi
 echo ""
 echo -e "${YELLOW}当前路由规则：${NC}"
 echo "--- 主路由表 ---"
 ip route show table main
 echo ""
-echo "--- 内网路由表 (table $TABLE_NAME) ---"
+echo "--- 标记路由表 (table $TABLE_NAME) ---"
 ip route show table $TABLE_NAME 2>/dev/null || echo "路由表为空"
 echo ""
 echo "--- 策略路由规则 ---"
 ip rule show
 echo ""
 echo "--- iptables mangle 规则 ---"
-echo "TCP 规则："
-iptables -t mangle -L OUTPUT -n -v | grep -E "tcp.*dpt:($(echo $TARGET_PORTS | tr ',' '|' | tr '-' '|'))" || echo "未找到 TCP 规则"
-if [ "$SUPPORT_UDP" = "y" ]; then
-    echo "UDP 规则："
-    iptables -t mangle -L OUTPUT -n -v | grep -E "udp.*dpt:($(echo $TARGET_PORTS | tr ',' '|' | tr '-' '|'))" || echo "未找到 UDP 规则"
-fi
+echo "标记规则："
+iptables -t mangle -L OUTPUT -n -v | grep -E "MARK|CONNMARK" | head -10
 echo ""
 echo -e "${YELLOW}验证命令：${NC}"
-echo "1. 测试内网端口分流："
-echo "   curl --interface $PRIVATE_IP -v http://目标IP:$(echo $TARGET_PORTS | cut -d'-' -f1)"
-echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and port $(echo $TARGET_PORTS | cut -d'-' -f1)"
-echo ""
-echo "2. 测试公网端口："
-echo "   curl --interface $PUBLIC_IP -v http://目标IP:80"
-echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and not port $(echo $TARGET_PORTS | cut -d'-' -f1)"
+if [ "$ROUTE_DIRECTION" = "public" ]; then
+    echo "1. 测试指定端口走公网："
+    echo "   curl --interface $PUBLIC_IP -v http://目标IP:$(echo $TARGET_PORTS | cut -d'-' -f1)"
+    echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and port $(echo $TARGET_PORTS | cut -d'-' -f1)"
+    echo ""
+    echo "2. 测试其他端口走内网："
+    echo "   curl --interface $PRIVATE_IP -v http://目标IP:80"
+    echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and not port $(echo $TARGET_PORTS | cut -d'-' -f1)"
+else
+    echo "1. 测试指定端口走内网："
+    echo "   curl --interface $PRIVATE_IP -v http://目标IP:$(echo $TARGET_PORTS | cut -d'-' -f1)"
+    echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and port $(echo $TARGET_PORTS | cut -d'-' -f1)"
+    echo ""
+    echo "2. 测试其他端口走公网："
+    echo "   curl --interface $PUBLIC_IP -v http://目标IP:80"
+    echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and not port $(echo $TARGET_PORTS | cut -d'-' -f1)"
+fi
 echo ""
 echo -e "${GREEN}✓ 配置已持久化，重启后自动生效${NC}"
 echo ""
