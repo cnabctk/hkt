@@ -336,8 +336,6 @@ iptables -t mangle -A OUTPUT -p udp --dport $port_config -j CONNMARK --save-mark
             ;;
         multi)
             # 对于多个端口，使用 multiport 模块更高效
-            # 将逗号分隔的端口转换为逗号分隔的列表（去掉空格）
-            PORT_LIST=$(echo $port_config | tr ',' ' ')
             rules="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $port_config -j CONNMARK --save-mark"
             if [ "$support_udp" = "y" ]; then
@@ -348,7 +346,6 @@ iptables -t mangle -A OUTPUT -p udp -m multiport --dports $port_config -j CONNMA
             ;;
         range)
             # 对于端口范围，使用 multiport 模块，格式为 port:port
-            # 将 10000-20000 转换为 10000:20000
             PORT_RANGE=$(echo $port_config | sed 's/-/:/')
             rules="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $PORT_RANGE -j MARK --set-mark $mark_value
 iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $PORT_RANGE -j CONNMARK --save-mark"
@@ -464,80 +461,67 @@ PORT_FILENAME=$(echo "$TARGET_PORTS" | tr ',' '_' | tr '-' '_')
 SERVICE_FILE="/etc/systemd/system/route-port-${PORT_FILENAME}.service"
 SCRIPT_FILE="/usr/local/bin/route-port-${PORT_FILENAME}.sh"
 
-# 生成应用规则的脚本
-cat > $SCRIPT_FILE <<'EOF'
+# 生成 iptables 规则用于持久化脚本
+IPTABLES_RULES_FOR_SCRIPT=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP")
+
+# 生成应用规则的脚本（使用 cat 和 EOF 直接嵌入，避免 sed 转义问题）
+cat > $SCRIPT_FILE <<EOF
 #!/bin/bash
 # 自动应用端口分流规则（由一键脚本生成）
+# 生成时间: $(date)
 
-INTERFACE="__INTERFACE__"
-PUBLIC_GW="__PUBLIC_GW__"
-PUBLIC_IP="__PUBLIC_IP__"
-PRIVATE_GW="__PRIVATE_GW__"
-PRIVATE_IP="__PRIVATE_IP__"
-TARGET_PORTS="__TARGET_PORTS__"
-PORT_TYPE="__PORT_TYPE__"
-MARK_VALUE="__MARK_VALUE__"
-TABLE_ID="__TABLE_ID__"
-TABLE_NAME="__TABLE_NAME__"
-SUPPORT_UDP="__SUPPORT_UDP__"
+INTERFACE="$INTERFACE"
+PUBLIC_GW="$PUBLIC_GW"
+PUBLIC_IP="$PUBLIC_IP"
+PRIVATE_GW="$PRIVATE_GW"
+PRIVATE_IP="$PRIVATE_IP"
+TARGET_PORTS="$TARGET_PORTS"
+PORT_TYPE="$PORT_TYPE"
+MARK_VALUE="$MARK_VALUE"
+TABLE_ID="$TABLE_ID"
+TABLE_NAME="$TABLE_NAME"
+SUPPORT_UDP="$SUPPORT_UDP"
 
 # 等待网络就绪
 sleep 2
 
 # 设置 sysctl
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null 2>&1 || true
 
 # 设置主路由表
 ip route del default 2>/dev/null || true
-ip route del default dev $INTERFACE 2>/dev/null || true
-ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
+ip route del default dev \$INTERFACE 2>/dev/null || true
+ip route add default via \$PUBLIC_GW dev \$INTERFACE src \$PUBLIC_IP
 
 # 设置内网路由表
-ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
-ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
+ip route del default via \$PRIVATE_GW dev \$INTERFACE table \$TABLE_NAME 2>/dev/null || true
+ip route add default via \$PRIVATE_GW dev \$INTERFACE src \$PRIVATE_IP table \$TABLE_NAME
 
 # 清理旧规则
 # 获取所有带标记的 OUTPUT 规则并删除
-iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "MARK set 0x1" | awk '{print $1}' | sort -r | while read line; do
-    iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "MARK set 0x1" | awk '{print \$1}' | sort -r | while read line; do
+    iptables -t mangle -D OUTPUT \$line 2>/dev/null || true
 done
 
-iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "CONNMARK save" | awk '{print $1}' | sort -r | while read line; do
-    iptables -t mangle -D OUTPUT $line 2>/dev/null || true
+iptables -t mangle -L OUTPUT -n --line-numbers 2>/dev/null | grep "CONNMARK save" | awk '{print \$1}' | sort -r | while read line; do
+    iptables -t mangle -D OUTPUT \$line 2>/dev/null || true
 done
 
-iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
 
 # 添加新规则
-__IPTABLES_RULES__
+$IPTABLES_RULES_FOR_SCRIPT
 
 # 添加连接标记恢复规则
-iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark
+iptables -t mangle -A PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark
 
 # 添加策略路由规则
-ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
-ip rule add fwmark $MARK_VALUE table $TABLE_NAME
+ip rule del fwmark \$MARK_VALUE table \$TABLE_NAME 2>/dev/null || true
+ip rule add fwmark \$MARK_VALUE table \$TABLE_NAME
 
 exit 0
 EOF
-
-# 替换脚本中的变量
-sed -i "s/__INTERFACE__/$INTERFACE/g" $SCRIPT_FILE
-sed -i "s/__PUBLIC_GW__/$PUBLIC_GW/g" $SCRIPT_FILE
-sed -i "s/__PUBLIC_IP__/$PUBLIC_IP/g" $SCRIPT_FILE
-sed -i "s/__PRIVATE_GW__/$PRIVATE_GW/g" $SCRIPT_FILE
-sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" $SCRIPT_FILE
-sed -i "s/__TARGET_PORTS__/$TARGET_PORTS/g" $SCRIPT_FILE
-sed -i "s/__PORT_TYPE__/$PORT_TYPE/g" $SCRIPT_FILE
-sed -i "s/__MARK_VALUE__/$MARK_VALUE/g" $SCRIPT_FILE
-sed -i "s/__TABLE_ID__/$TABLE_ID/g" $SCRIPT_FILE
-sed -i "s/__TABLE_NAME__/$TABLE_NAME/g" $SCRIPT_FILE
-sed -i "s/__SUPPORT_UDP__/$SUPPORT_UDP/g" $SCRIPT_FILE
-
-# 生成 iptables 规则并替换（需要转义特殊字符）
-IPTABLES_RULES_ESC=$(generate_iptables_rules "$TARGET_PORTS" "$PORT_TYPE" "$MARK_VALUE" "$SUPPORT_UDP" | sed 's/[&/\]/\\&/g')
-sed -i "s/__IPTABLES_RULES__/$IPTABLES_RULES_ESC/g" $SCRIPT_FILE
 
 chmod +x $SCRIPT_FILE
 
@@ -588,20 +572,20 @@ ip rule show
 echo ""
 echo "--- iptables mangle 规则 ---"
 echo "TCP 规则："
-iptables -t mangle -L OUTPUT -n -v | grep -E "tcp.*dpt:$TARGET_PORTS" || echo "未找到 TCP 规则"
+iptables -t mangle -L OUTPUT -n -v | grep -E "tcp.*dpt:($(echo $TARGET_PORTS | tr ',' '|' | tr '-' '|'))" || echo "未找到 TCP 规则"
 if [ "$SUPPORT_UDP" = "y" ]; then
     echo "UDP 规则："
-    iptables -t mangle -L OUTPUT -n -v | grep -E "udp.*dpt:$TARGET_PORTS" || echo "未找到 UDP 规则"
+    iptables -t mangle -L OUTPUT -n -v | grep -E "udp.*dpt:($(echo $TARGET_PORTS | tr ',' '|' | tr '-' '|'))" || echo "未找到 UDP 规则"
 fi
 echo ""
 echo -e "${YELLOW}验证命令：${NC}"
 echo "1. 测试内网端口分流："
-echo "   curl --interface $PRIVATE_IP -v http://目标IP:$TARGET_PORTS"
-echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and port $TARGET_PORTS"
+echo "   curl --interface $PRIVATE_IP -v http://目标IP:$(echo $TARGET_PORTS | cut -d'-' -f1)"
+echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and port $(echo $TARGET_PORTS | cut -d'-' -f1)"
 echo ""
 echo "2. 测试公网端口："
 echo "   curl --interface $PUBLIC_IP -v http://目标IP:80"
-echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and not port $TARGET_PORTS"
+echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and not port $(echo $TARGET_PORTS | cut -d'-' -f1)"
 echo ""
 echo -e "${GREEN}✓ 配置已持久化，重启后自动生效${NC}"
 echo ""
