@@ -28,84 +28,145 @@ echo ">>> 开始配置..."
 echo ">>> 配置 sysctl..."
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
 sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null
-# 持久化
-if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf; then
+
+# 持久化 sysctl 配置
+if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
 fi
-if ! grep -q "net.ipv4.conf.$INTERFACE.rp_filter" /etc/sysctl.conf; then
+if ! grep -q "net.ipv4.conf.$INTERFACE.rp_filter" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.conf.$INTERFACE.rp_filter = 2" >> /etc/sysctl.conf
 fi
 
-# 2. 设置主路由表（公网）的默认网关，并指定源 IP
-echo ">>> 设置主路由表公网默认路由..."
-ip route replace default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
-
-# 3. 创建自定义路由表（内网）
+# 2. 确保 rt_tables 文件存在并添加自定义路由表
 echo ">>> 创建自定义路由表..."
-# 在 rt_tables 中添加表名（如果尚未添加）
-if ! grep -q "^$TABLE_ID $TABLE_NAME" /etc/iproute2/rt_tables; then
-    echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
+# 查找 rt_tables 文件位置
+if [ -f /etc/iproute2/rt_tables ]; then
+    RT_TABLES="/etc/iproute2/rt_tables"
+elif [ -f /usr/lib/iproute2/rt_tables ]; then
+    RT_TABLES="/usr/lib/iproute2/rt_tables"
+elif [ -f /etc/iproute2/rt_tables.d/rt_tables ]; then
+    RT_TABLES="/etc/iproute2/rt_tables.d/rt_tables"
+else
+    # 如果文件不存在，创建目录和文件
+    echo ">>> 创建 /etc/iproute2/rt_tables 文件..."
+    mkdir -p /etc/iproute2
+    RT_TABLES="/etc/iproute2/rt_tables"
+    cat > $RT_TABLES <<EOF
+#
+# reserved values
+#
+255     local
+254     main
+253     default
+0       unspec
+#
+# local
+#
+#1      inr.ruhep
+EOF
 fi
-# 添加内网默认路由，指定源 IP 为内网 IP
-ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME || true
 
-# 4. 配置 iptables 标记
+# 在 rt_tables 中添加自定义表名（如果尚未添加）
+if ! grep -q "^$TABLE_ID $TABLE_NAME" $RT_TABLES 2>/dev/null; then
+    echo "$TABLE_ID $TABLE_NAME" >> $RT_TABLES
+    echo ">>> 已在 $RT_TABLES 中添加路由表定义"
+fi
+
+# 3. 设置主路由表（公网）的默认网关，并指定源 IP
+echo ">>> 设置主路由表公网默认路由..."
+# 先删除可能存在的默认路由，避免冲突
+ip route del default dev $INTERFACE 2>/dev/null || true
+ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
+
+# 4. 创建自定义路由表（内网）
+echo ">>> 配置内网路由表..."
+# 删除可能已存在的路由
+ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
+# 添加内网默认路由，指定源 IP 为内网 IP
+ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
+
+# 5. 配置 iptables 标记
 echo ">>> 配置 iptables 标记..."
 # 清除可能已存在的相关规则（避免重复）
 iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
 iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j CONNMARK --save-mark 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+
 # 添加新规则
 iptables -t mangle -A OUTPUT -p tcp --dport $TARGET_PORT -j MARK --set-mark $MARK_VALUE
 iptables -t mangle -A OUTPUT -p tcp --dport $TARGET_PORT -j CONNMARK --save-mark
-# 可选：为响应包恢复标记（确保连接对称）
-iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+# 为响应包恢复标记（确保连接对称）
 iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark
 
-# 5. 添加策略路由规则
+# 6. 添加策略路由规则
 echo ">>> 添加策略路由规则..."
 # 删除可能已存在的相同规则
 ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
 # 添加新规则
 ip rule add fwmark $MARK_VALUE table $TABLE_NAME
 
-# 6. 持久化配置：创建 systemd 服务，确保重启后自动生效
+# 7. 持久化配置：创建 systemd 服务，确保重启后自动生效
 echo ">>> 创建 systemd 服务以实现持久化..."
 SERVICE_FILE="/etc/systemd/system/route-port${TARGET_PORT}.service"
 SCRIPT_FILE="/usr/local/bin/route-port${TARGET_PORT}.sh"
 
 # 生成应用规则的脚本
-cat > $SCRIPT_FILE <<EOF
+cat > $SCRIPT_FILE <<'EOF'
 #!/bin/bash
 # 自动应用端口分流规则（由一键脚本生成）
-INTERFACE="$INTERFACE"
-PUBLIC_GW="$PUBLIC_GW"
-PUBLIC_IP="$PUBLIC_IP"
-PRIVATE_GW="$PRIVATE_GW"
-PRIVATE_IP="$PRIVATE_IP"
-TARGET_PORT="$TARGET_PORT"
-MARK_VALUE="$MARK_VALUE"
-TABLE_NAME="$TABLE_NAME"
+
+# 配置参数
+INTERFACE="__INTERFACE__"
+PUBLIC_GW="__PUBLIC_GW__"
+PUBLIC_IP="__PUBLIC_IP__"
+PRIVATE_GW="__PRIVATE_GW__"
+PRIVATE_IP="__PRIVATE_IP__"
+TARGET_PORT="__TARGET_PORT__"
+MARK_VALUE="__MARK_VALUE__"
+TABLE_ID="__TABLE_ID__"
+TABLE_NAME="__TABLE_NAME__"
+
+# 等待网络就绪
+sleep 2
 
 # 设置 sysctl（确保反向路径过滤宽松）
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
-sysctl -w net.ipv4.conf.\$INTERFACE.rp_filter=2 >/dev/null
+sysctl -w net.ipv4.conf.$INTERFACE.rp_filter=2 >/dev/null
 
 # 设置主路由表公网默认路由
-ip route replace default via \$PUBLIC_GW dev \$INTERFACE src \$PUBLIC_IP
+ip route del default dev $INTERFACE 2>/dev/null || true
+ip route add default via $PUBLIC_GW dev $INTERFACE src $PUBLIC_IP
 
 # 设置内网路由表（表可能已存在，添加路由）
-ip route add default via \$PRIVATE_GW dev \$INTERFACE src \$PRIVATE_IP table \$TABLE_NAME 2>/dev/null || true
+ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME 2>/dev/null || true
+ip route add default via $PRIVATE_GW dev $INTERFACE src $PRIVATE_IP table $TABLE_NAME
 
-# 添加 iptables 标记
-iptables -t mangle -A OUTPUT -p tcp --dport \$TARGET_PORT -j MARK --set-mark \$MARK_VALUE
-iptables -t mangle -A OUTPUT -p tcp --dport \$TARGET_PORT -j CONNMARK --save-mark
-iptables -t mangle -A PREROUTING -i \$INTERFACE -m connmark --mark \$MARK_VALUE -j CONNMARK --restore-mark
+# 添加 iptables 标记（先清除旧规则避免重复）
+iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j CONNMARK --save-mark 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark 2>/dev/null || true
+
+iptables -t mangle -A OUTPUT -p tcp --dport $TARGET_PORT -j MARK --set-mark $MARK_VALUE
+iptables -t mangle -A OUTPUT -p tcp --dport $TARGET_PORT -j CONNMARK --save-mark
+iptables -t mangle -A PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark
 
 # 添加策略路由规则
-ip rule add fwmark \$MARK_VALUE table \$TABLE_NAME 2>/dev/null || true
+ip rule del fwmark $MARK_VALUE table $TABLE_NAME 2>/dev/null || true
+ip rule add fwmark $MARK_VALUE table $TABLE_NAME
 
 exit 0
 EOF
+
+# 替换脚本中的变量
+sed -i "s/__INTERFACE__/$INTERFACE/g" $SCRIPT_FILE
+sed -i "s/__PUBLIC_GW__/$PUBLIC_GW/g" $SCRIPT_FILE
+sed -i "s/__PUBLIC_IP__/$PUBLIC_IP/g" $SCRIPT_FILE
+sed -i "s/__PRIVATE_GW__/$PRIVATE_GW/g" $SCRIPT_FILE
+sed -i "s/__PRIVATE_IP__/$PRIVATE_IP/g" $SCRIPT_FILE
+sed -i "s/__TARGET_PORT__/$TARGET_PORT/g" $SCRIPT_FILE
+sed -i "s/__MARK_VALUE__/$MARK_VALUE/g" $SCRIPT_FILE
+sed -i "s/__TABLE_ID__/$TABLE_ID/g" $SCRIPT_FILE
+sed -i "s/__TABLE_NAME__/$TABLE_NAME/g" $SCRIPT_FILE
 
 chmod +x $SCRIPT_FILE
 
@@ -113,13 +174,15 @@ chmod +x $SCRIPT_FILE
 cat > $SERVICE_FILE <<EOF
 [Unit]
 Description=Route Port $TARGET_PORT via Private Gateway
-After=network.target
+After=network.target network-online.target
 Wants=network.target
+Before=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=$SCRIPT_FILE
 RemainAfterExit=yes
+StandardOutput=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -130,22 +193,42 @@ systemctl daemon-reload
 systemctl enable route-port${TARGET_PORT}.service
 systemctl start route-port${TARGET_PORT}.service
 
+echo ""
+echo "=========================================="
 echo ">>> 配置完成！"
+echo "=========================================="
+echo ""
 echo "当前路由规则如下："
+echo "--- 主路由表 ---"
 ip route show table main
+echo ""
+echo "--- 内网路由表 (table $TABLE_NAME) ---"
 ip route show table $TABLE_NAME
+echo ""
+echo "--- 策略路由规则 ---"
 ip rule show
-echo
+echo ""
+echo "--- iptables mangle 规则 ---"
+iptables -t mangle -L -n -v | grep -E "($TARGET_PORT|CONNMARK)" || echo "未找到相关规则"
+echo ""
 echo "验证方法："
 echo "1. 从本机访问目标端口 $TARGET_PORT 的服务，抓包确认源 IP 为 $PRIVATE_IP："
 echo "   tcpdump -i $INTERFACE -n host $PRIVATE_GW and port $TARGET_PORT"
-echo "2. 访问其他端口，抓包应看到源 IP 为 $PUBLIC_IP"
-echo
-echo "重启后配置将自动生效。如需回滚，可执行以下命令："
-echo "   systemctl disable route-port${TARGET_PORT}.service && rm $SERVICE_FILE $SCRIPT_FILE"
+echo ""
+echo "2. 访问其他端口，抓包应看到源 IP 为 $PUBLIC_IP："
+echo "   tcpdump -i $INTERFACE -n host $PUBLIC_GW and not port $TARGET_PORT"
+echo ""
+echo "重启后配置将自动生效。"
+echo ""
+echo "如需回滚，可执行以下命令："
+echo "   systemctl disable route-port${TARGET_PORT}.service"
+echo "   systemctl stop route-port${TARGET_PORT}.service"
+echo "   rm $SERVICE_FILE $SCRIPT_FILE"
+echo "   systemctl daemon-reload"
 echo "   iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j MARK --set-mark $MARK_VALUE"
 echo "   iptables -t mangle -D OUTPUT -p tcp --dport $TARGET_PORT -j CONNMARK --save-mark"
 echo "   iptables -t mangle -D PREROUTING -i $INTERFACE -m connmark --mark $MARK_VALUE -j CONNMARK --restore-mark"
 echo "   ip rule del fwmark $MARK_VALUE table $TABLE_NAME"
 echo "   ip route del default via $PUBLIC_GW dev $INTERFACE"
 echo "   ip route del default via $PRIVATE_GW dev $INTERFACE table $TABLE_NAME"
+echo "   sed -i '/^$TABLE_ID $TABLE_NAME/d' $RT_TABLES"
